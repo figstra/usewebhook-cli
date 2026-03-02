@@ -41,6 +41,7 @@ _testmain.go
 # Dist
 dist
 usewebhook
+usewebhook-cli
 *.tar.gz
 
 # Tmp files
