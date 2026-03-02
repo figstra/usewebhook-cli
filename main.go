@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 )
 
@@ -26,23 +27,37 @@ var (
 	Version          = "dev"
 	APIURL           = "https://usewebhook.com/api/webhooks/"
 	BaseURL          = "https://usewebhook.com"
+	WSURL            = "wss://usewebhook.com/ws/webhook/"
 	SettingsFilename = ".usewebhook"
 )
 
 // WebhookRequest represents a single webhook request
 type WebhookRequest struct {
-	RequestID string            `json:"request_id"`
-	Timestamp string            `json:"timestamp"`
-	IP        string            `json:"ip"`
-	Method    string            `json:"method"`
-	Query     string            `json:"query"`
-	Headers   map[string]string `json:"headers"`
-	Body      string            `json:"body"`
+	RequestID   string            `json:"request_id"`
+	Timestamp   string            `json:"timestamp"`
+	IP          string            `json:"ip"`
+	CountryCode string            `json:"country_code"`
+	UserAgent   string            `json:"user_agent"`
+	Method      string            `json:"method"`
+	Scheme      string            `json:"scheme"`
+	Hostname    string            `json:"hostname"`
+	Path        string            `json:"path"`
+	Query       string            `json:"query"`
+	Headers     map[string]string `json:"headers"`
+	Body        string            `json:"body"`
 }
 
-// WebhookResponse represents the response from the webhook API
+// WebhookResponse represents the response from the webhook HTTP API
 type WebhookResponse struct {
 	Requests []WebhookRequest `json:"requests"`
+}
+
+// WSMessage is the envelope for WebSocket messages from the server.
+// type "webhook.init" contains historical Requests; type "webhook.new" contains a single Request.
+type WSMessage struct {
+	Type     string           `json:"type"`
+	Requests []WebhookRequest `json:"requests"`
+	Request  *WebhookRequest  `json:"request"`
 }
 
 // Config represents the user's configuration
@@ -57,7 +72,6 @@ type AppConfig struct {
 	ForwardTo    string
 	WebhookID    string
 	RequestID    string
-	PollSleep    time.Duration
 	InitialSleep time.Duration
 }
 
@@ -196,43 +210,95 @@ func decodeBase64Body(encodedBody string) (string, string, error) {
 	return string(decoded), originalContentType, nil
 }
 
-// pollWebhook continuously polls the webhook API for new requests
-func pollWebhook(config AppConfig) {
-	lastPollTime := time.Now().UTC()
+// fetchSingleRequest fetches a specific request by ID from the HTTP API and exits
+func fetchSingleRequest(config AppConfig) {
+	params := url.Values{}
+	params.Set("request_id", config.RequestID)
+
+	webhookData, err := fetchWebhookData(config.WebhookID, params)
+	if err != nil {
+		color.Red("Error fetching webhook data: %v", err)
+		os.Exit(1)
+	}
+
+	if len(webhookData.Requests) == 0 {
+		color.Red("No requests found for request ID: %s", config.RequestID)
+		os.Exit(1)
+	}
+
+	for _, request := range webhookData.Requests {
+		logRequest(request, config.FullLog)
+		if config.ForwardTo != "" {
+			forwardRequest(request, config.ForwardTo)
+		}
+	}
+	os.Exit(0)
+}
+
+// connectAndListen opens a WebSocket connection and dispatches incoming requests until an error occurs.
+// seen tracks request IDs already processed; isFirstConnect suppresses the history batch on the initial connection.
+func connectAndListen(config AppConfig, seen map[string]bool, isFirstConnect *bool) error {
+	conn, _, err := websocket.DefaultDialer.Dial(WSURL+config.WebhookID, http.Header{
+		"Origin": []string{BaseURL},
+	})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
 	for {
-		params := url.Values{}
-		if config.RequestID != "" {
-			params.Set("request_id", config.RequestID)
-		} else {
-			params.Set("since", lastPollTime.Format(time.RFC3339))
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return err
 		}
 
-		webhookData, err := fetchWebhookData(config.WebhookID, params)
-		if err != nil {
-			color.Red("Error fetching webhook data: %v", err)
-			time.Sleep(config.InitialSleep)
+		var msg WSMessage
+		if err := json.Unmarshal(message, &msg); err != nil {
+			color.Yellow("Warning: failed to parse message: %v", err)
 			continue
 		}
 
-		for _, request := range webhookData.Requests {
-			logRequest(request, config.FullLog)
-			if config.ForwardTo != "" {
-				forwardRequest(request, config.ForwardTo)
+		switch msg.Type {
+		case "webhook.init":
+			for _, req := range msg.Requests {
+				if *isFirstConnect {
+					// Mark historical requests as seen without displaying them
+					seen[req.RequestID] = true
+				} else if !seen[req.RequestID] {
+					// Requests that arrived while we were disconnected
+					seen[req.RequestID] = true
+					logRequest(req, config.FullLog)
+					if config.ForwardTo != "" {
+						forwardRequest(req, config.ForwardTo)
+					}
+				}
+			}
+			*isFirstConnect = false
+
+		case "webhook.new":
+			if msg.Request != nil && !seen[msg.Request.RequestID] {
+				seen[msg.Request.RequestID] = true
+				logRequest(*msg.Request, config.FullLog)
+				if config.ForwardTo != "" {
+					forwardRequest(*msg.Request, config.ForwardTo)
+				}
 			}
 		}
+	}
+}
 
-		// if single request mode, exit after the first request
-		if config.RequestID != "" {
-			if len(webhookData.Requests) <= 0 {
-				color.Red("No requests found for request ID: %s", config.RequestID)
-				os.Exit(1)
-			}
-			os.Exit(0)
+// listenWebSocket connects via WebSocket and reconnects automatically on disconnect.
+// The seen map and isFirstConnect flag persist across reconnects to avoid replaying requests.
+func listenWebSocket(config AppConfig) {
+	seen := make(map[string]bool)
+	isFirstConnect := true
+
+	for {
+		err := connectAndListen(config, seen, &isFirstConnect)
+		if err != nil {
+			color.Red("WebSocket error: %v. Reconnecting...", err)
+			time.Sleep(config.InitialSleep)
 		}
-
-		lastPollTime = time.Now().UTC()
-		time.Sleep(config.PollSleep)
 	}
 }
 
@@ -311,7 +377,6 @@ func saveConfig(config *Config) error {
 // createRootCommand creates and returns the root command for the CLI
 func createRootCommand() *cobra.Command {
 	appConfig := AppConfig{
-		PollSleep:    3 * time.Second,
 		InitialSleep: 1 * time.Second,
 	}
 
@@ -378,6 +443,7 @@ func runRootCommand(cmd *cobra.Command, args []string, appConfig *AppConfig) {
 
 	if appConfig.RequestID != "" {
 		color.Green("Single request mode. Retrieving webhook=%s request=%s\n\n", appConfig.WebhookID, appConfig.RequestID)
+		fetchSingleRequest(*appConfig)
 	} else {
 		color.Green("Dashboard: %s/?id=%s", BaseURL, appConfig.WebhookID)
 		color.Green("Webhook URL: %s/%s", BaseURL, appConfig.WebhookID)
@@ -385,8 +451,8 @@ func runRootCommand(cmd *cobra.Command, args []string, appConfig *AppConfig) {
 			color.Green("Forwarding to: %s", appConfig.ForwardTo)
 		}
 		color.HiBlack("\nPress Ctrl+C to stop\n\n")
+		listenWebSocket(*appConfig)
 	}
-	pollWebhook(*appConfig)
 }
 
 // contains checks if a slice contains a specific item

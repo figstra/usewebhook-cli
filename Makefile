@@ -2,6 +2,12 @@ PKG = github.com/figstra/usewebhook-cli
 VERSION ?= dev
 LDFLAGS = -ldflags "-X 'main.Version=$(VERSION)'"
 
+build:
+	go build $(LDFLAGS) -o dist/usewebhook .
+
+run: build
+	./dist/usewebhook
+
 deps:
 	go get ./...
 
