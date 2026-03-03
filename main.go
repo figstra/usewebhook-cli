@@ -162,9 +162,20 @@ func forwardRequest(request WebhookRequest, forwardTo string) {
 		return
 	}
 
-	// Set headers
+	// Hop-by-hop headers that must not be forwarded (RFC 2616 §13.5.1).
+	// Content-Length is also skipped so Go can compute it from the actual body.
+	skipHeaders := map[string]bool{
+		"Transfer-Encoding": true,
+		"Connection":        true,
+		"Keep-Alive":        true,
+		"Content-Length":     true,
+		"Host":              true,
+	}
+
 	for k, v := range request.Headers {
-		req.Header.Set(k, v)
+		if !skipHeaders[k] {
+			req.Header.Set(k, v)
+		}
 	}
 
 	// Handle Base64 content-type logic
@@ -174,8 +185,9 @@ func forwardRequest(request WebhookRequest, forwardTo string) {
 			color.Red("Error decoding Base64 body: %v", err)
 			return
 		}
-		req.Body = io.NopCloser(strings.NewReader(decodedBody)) // Set decoded body
-		req.Header.Set("Content-Type", originalContentType)     // Set original content-type
+		req.Body = io.NopCloser(strings.NewReader(decodedBody))   // Set decoded body
+		req.ContentLength = int64(len(decodedBody))              // Update length to match decoded body
+		req.Header.Set("Content-Type", originalContentType)      // Set original content-type
 		req.Header.Del("X-Original-Content-Type")
 	}
 
