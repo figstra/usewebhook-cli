@@ -14,7 +14,7 @@ No sign up required. Just send HTTP requests to your webhook URL.
 The easiest way to install is using the automated script:
 
 ```
-curl -sSL https://usewebhook.com/install.sh | bash
+curl -fsSL https://usewebhook.com/install.sh | bash
 ```
 
 It will detect your OS and architecture, download the corresponding executable, and add it to your PATH.
@@ -86,6 +86,7 @@ Simply follow the next steps:
 
 ## Change log
 
+- **1.0.2:** Update dependencies
 - **1.0.1:** Update dependencies
 - **1.0.0:** Release v1
 
